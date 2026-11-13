@@ -98,6 +98,8 @@ def available_resolutions():
     url = data.get('url')
 
     if not url:
+        return jsonify({"error": "Missing 'url' parameter in the request body."}), 400
+    if not is_valid_youtube_url(url):
         return jsonify({"error": "Invalid YouTube URL."}), 400
 
     try:
