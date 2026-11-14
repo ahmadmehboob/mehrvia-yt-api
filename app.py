@@ -7,11 +7,19 @@ Mehrvia Tech blog's Video Downloader page:
   - CORS enabled so https://mehrviatech.blogspot.com can call it
   - original endpoints (/download/<resolution>, /video_info,
     /available_resolutions) kept as-is
+  - tools-backend endpoint GET /api/rates: live exchange rates for the
+    blog's Currency Converter tool (frankfurter.app first, open.er-api.com
+    fallback; cached 1 hour; no API key)
 """
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pytubefix import YouTube
+import json
 import re
+import time
+import urllib.error
+import urllib.request
 
 app = Flask(__name__)
 CORS(app)  # allow the Blogger page to call this API
@@ -174,6 +182,112 @@ def resolve():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)[:200]}), 500
+
+
+# ---------------------------------------------------------------------------
+# Exchange rates (tools backend): GET /api/rates?base=USD
+# Live rates for the blog's Currency Converter tool. Upstream is the free
+# frankfurter.app API first, with open.er-api.com as fallback; no API key.
+# Results are cached in memory for 1 hour so repeated calls are fast and
+# don't hammer the upstream services.
+# ---------------------------------------------------------------------------
+
+RATES_TTL_SECONDS = 3600
+_RATES_CACHE = {}  # base -> {"fetched_at": float, "payload": dict}
+
+# Currencies the Currency Converter tool needs. frankfurter.app (ECB rates)
+# does not cover all of these (e.g. PKR, AED, SAR), so any currency missing
+# from its response is filled in from the fallback source.
+RATES_CURRENCIES = [
+    "USD", "PKR", "EUR", "GBP", "AED", "SAR", "INR", "CNY", "JPY", "AUD",
+    "CAD", "TRY", "CHF", "KWD", "QAR", "BHD", "OMR", "MYR", "IDR", "BDT",
+    "NPR", "LKR",
+]
+
+
+def _fetch_json(url, timeout=10):
+    req = urllib.request.Request(url,
+                                 headers={"User-Agent": "mehrvia-yt-api/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _rates_from_frankfurter(base):
+    """Returns (date, rates dict) or None on any failure."""
+    try:
+        data = _fetch_json(
+            "https://api.frankfurter.app/latest?from=" + base)
+        rates = data.get("rates") or {}
+        if not rates:
+            return None
+        return data.get("date"), {k: float(v) for k, v in rates.items()}
+    except Exception:
+        return None
+
+
+def _rates_from_er_api(base):
+    """Returns (date, rates dict) or None on any failure."""
+    try:
+        data = _fetch_json(
+            "https://open.er-api.com/v6/latest/" + base)
+        if data.get("result") != "success":
+            return None
+        rates = data.get("rates") or {}
+        if not rates:
+            return None
+        ts = data.get("time_last_update_unix")
+        date = None
+        if ts:
+            date = datetime.fromtimestamp(
+                ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        return date, {k: float(v) for k, v in rates.items()}
+    except Exception:
+        return None
+
+
+def _get_rates(base):
+    cached = _RATES_CACHE.get(base)
+    now = time.time()
+    if cached and now - cached["fetched_at"] < RATES_TTL_SECONDS:
+        return cached["payload"]
+
+    date, rates = None, {}
+    primary = _rates_from_frankfurter(base)
+    if primary:
+        date, rates = primary
+    # Fill in any currencies frankfurter does not cover (e.g. PKR, AED, SAR).
+    missing = [c for c in RATES_CURRENCIES if c not in rates and c != base]
+    if missing:
+        fallback = _rates_from_er_api(base)
+        if fallback:
+            f_date, f_rates = fallback
+            if date is None:
+                date = f_date
+            for code in missing:
+                if code in f_rates:
+                    rates[code] = f_rates[code]
+
+    if not rates:
+        return None
+    if date is None:
+        date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+    rates[base] = 1.0
+    payload = {"base": base, "date": date, "rates": rates,
+               "source": "frankfurter.app + open.er-api.com"}
+    _RATES_CACHE[base] = {"fetched_at": now, "payload": payload}
+    return payload
+
+
+@app.route('/api/rates', methods=['GET'])
+def rates():
+    base = (request.args.get("base") or "USD").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", base):
+        return jsonify({"error": "Invalid base currency code."}), 400
+    payload = _get_rates(base)
+    if payload is None:
+        return jsonify({"error": "Exchange rates are unavailable right now."}), 502
+    return jsonify(payload)
 
 
 @app.route('/health', methods=['GET'])
